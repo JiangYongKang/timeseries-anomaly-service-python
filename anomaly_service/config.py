@@ -12,3 +12,6 @@ class ServiceConfig:
     default_timeout_seconds: float = 5.0
     min_baseline_windows: int = 3
     anomaly_zscore_threshold: float = 3.0
+    # 单次查询预算：窗口总数（窗口槽位 × 分组数）与参与计算的数据点数
+    max_query_windows: int = 10_000
+    max_query_points: int = 500_000

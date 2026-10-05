@@ -23,6 +23,7 @@ from .errors import (
     ValidationError,
     VersionNotFoundError,
 )
+from .models import GroupedQueryResult
 from .service import AnomalyService
 
 _NOT_FOUND = (DatasetNotFoundError, VersionNotFoundError)
@@ -31,6 +32,7 @@ _CONFLICT_CODES = {
     "duplicate_timestamp",
     "dataset_exists",
     "incompatible_schema",
+    "stale_base_version",
 }
 
 
@@ -38,6 +40,7 @@ class ImportRequest(BaseModel):
     points: list[dict]
     batch_id: str | None = None
     append: bool = False
+    base_version: int | None = Field(default=None, ge=0)
     timeout: float | None = Field(default=None, gt=0)
 
 
@@ -49,6 +52,7 @@ class QueryRequest(BaseModel):
     window_seconds: int = Field(gt=0)
     version: int | None = None
     baseline_aggregate: str = "mean"
+    group_by: str | None = None
     timeout: float | None = Field(default=None, gt=0)
 
 
@@ -88,6 +92,7 @@ def create_app(service: AnomalyService | None = None) -> FastAPI:
             req.points,
             batch_id=req.batch_id,
             append=req.append,
+            base_version=req.base_version,
             timeout=req.timeout,
         )
         return result.__dict__
@@ -102,6 +107,7 @@ def create_app(service: AnomalyService | None = None) -> FastAPI:
             req.window_seconds,
             version=req.version,
             baseline_aggregate=req.baseline_aggregate,
+            group_by=req.group_by,
             timeout=req.timeout,
         )
         return _serialize_query(result)
@@ -113,7 +119,45 @@ def create_app(service: AnomalyService | None = None) -> FastAPI:
     return app
 
 
+def _serialize_window(w) -> dict:
+    return {
+        "window_start": w.window_start,
+        "window_end": w.window_end,
+        "count": w.count,
+        "aggregate": w.aggregate,
+        "status": w.status.value,
+        "evidence": None
+        if w.evidence is None
+        else {
+            "metric": w.evidence.metric,
+            "window_value": w.evidence.window_value,
+            "baseline_mean": w.evidence.baseline_mean,
+            "baseline_std": w.evidence.baseline_std,
+            "zscore": w.evidence.zscore,
+            "threshold": w.evidence.threshold,
+            "reason": w.evidence.reason,
+        },
+    }
+
+
 def _serialize_query(result) -> dict:
+    if isinstance(result, GroupedQueryResult):
+        return {
+            "dataset": result.dataset,
+            "version": result.version,
+            "metric_field": result.metric_field,
+            "group_field": result.group_field,
+            "window_seconds": result.window_seconds,
+            "start_ts": result.start_ts,
+            "end_ts": result.end_ts,
+            "groups": [
+                {
+                    "group_value": g.group_value,
+                    "windows": [_serialize_window(w) for w in g.windows],
+                }
+                for g in result.groups
+            ],
+        }
     return {
         "dataset": result.dataset,
         "version": result.version,
@@ -121,25 +165,5 @@ def _serialize_query(result) -> dict:
         "window_seconds": result.window_seconds,
         "start_ts": result.start_ts,
         "end_ts": result.end_ts,
-        "windows": [
-            {
-                "window_start": w.window_start,
-                "window_end": w.window_end,
-                "count": w.count,
-                "aggregate": w.aggregate,
-                "status": w.status.value,
-                "evidence": None
-                if w.evidence is None
-                else {
-                    "metric": w.evidence.metric,
-                    "window_value": w.evidence.window_value,
-                    "baseline_mean": w.evidence.baseline_mean,
-                    "baseline_std": w.evidence.baseline_std,
-                    "zscore": w.evidence.zscore,
-                    "threshold": w.evidence.threshold,
-                    "reason": w.evidence.reason,
-                },
-            }
-            for w in result.windows
-        ],
+        "windows": [_serialize_window(w) for w in result.windows],
     }

@@ -16,6 +16,7 @@ from .errors import (
     DuplicateBatchError,
     DuplicatePointError,
     ResourceLimitError,
+    StaleSchemaError,
     VersionNotFoundError,
 )
 from .models import DataPoint, DatasetVersion, ImportResult, Schema
@@ -81,17 +82,23 @@ class VersionStore:
         self,
         dataset: str,
         points: list[DataPoint],
-        schema: Schema,
+        parsed_schema: Schema,
         batch_id: str | None,
         payload_hash: str,
         append: bool,
         *,
+        merge_schema=None,
+        base_version: int | None = None,
         before_publish=None,
     ) -> ImportResult:
         """在数据集锁内完成全部校验后一次性发布新版本。
 
-        ``before_publish(state, parent)`` 钩子可选，在持锁状态下、发布前
-        调用（供取消/超时检查）；抛异常则中止且无任何写入。
+        - ``merge_schema(parent_schema, batch_schema)``：追加时在**持锁状态
+          下**基于真实的父版本 schema 计算合并结构，保证并发演进下发布版本
+          的声明字段与实际数据完全对应；抛异常则中止且无任何写入；
+        - ``base_version``：可选的乐观并发令牌，声明请求基于的版本号
+          （数据集尚不存在时为 0）；与锁内实际最新版本不一致则拒绝；
+        - ``before_publish(state, parent)``：发布前的取消/超时检查钩子。
         """
         state = self._state(dataset, create=True)
         with state.lock:
@@ -124,6 +131,21 @@ class VersionStore:
                     code="dataset_exists",
                 )
 
+            actual_base = parent.version if parent is not None else 0
+            if base_version is not None and base_version != actual_base:
+                raise StaleSchemaError(
+                    f"追加基于版本 v{base_version}，但当前最新为 "
+                    f"v{actual_base}；请基于最新结构重试"
+                )
+
+            # 结构合并在锁内基于真实父版本进行，杜绝并发下字段被悄悄丢掉
+            if parent is None:
+                final_schema = parsed_schema
+            elif merge_schema is not None:
+                final_schema = merge_schema(parent.schema_, parsed_schema)
+            else:
+                final_schema = parsed_schema
+
             if parent is not None:
                 overlap = {p.ts for p in parent.points}.intersection(
                     p.ts for p in points
@@ -153,7 +175,7 @@ class VersionStore:
             snapshot = DatasetVersion(
                 dataset=dataset,
                 version=version_no,
-                schema_=schema,
+                schema_=final_schema,
                 points=merged_points,
                 parent_version=parent.version if parent is not None else None,
                 batch_id=key,

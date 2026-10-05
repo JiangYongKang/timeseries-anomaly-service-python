@@ -186,13 +186,21 @@ class DataValidator:
     # -- schema 演进 ------------------------------------------------------
 
     def check_compatible_append(self, old: Schema, new: Schema) -> Schema:
-        """返回合并后的演进 schema；不兼容则抛 SchemaEvolutionError。"""
+        """返回合并后的演进 schema；不兼容则抛 SchemaEvolutionError。
+
+        兼容范围：
+        - 追加批次可省略既有的**可空**列（读取时按 None 处理），
+          多方并发追加各自的可选维度因此可以任意顺序交错；
+        - 省略**必填**列、删除列、类型收窄/冲突 → 不兼容。
+        """
         merged: list[FieldSpec] = list(old.fields)
         for old_spec in old.fields:
             new_spec = new.get(old_spec.name)
             if new_spec is None:
+                if old_spec.nullable:
+                    continue  # 可空列允许省略，历史与新点读取均为 None
                 raise SchemaEvolutionError(
-                    f"追加数据缺少既有字段 {old_spec.name!r}，schema 演进不兼容"
+                    f"追加数据缺少既有必填字段 {old_spec.name!r}，schema 演进不兼容"
                 )
             if new_spec.type is not old_spec.type and not (
                 old_spec.type is FieldType.INT and new_spec.type is FieldType.FLOAT

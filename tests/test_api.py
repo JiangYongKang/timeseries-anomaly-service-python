@@ -95,3 +95,70 @@ def test_query_after_append_sees_new_version(client):
         "dataset": "d", "metric_field": "x",
         "start_ts": 0, "end_ts": 2 * NS, "window_seconds": 1, "version": 1}).json()
     assert q_old == q_before
+
+
+def test_http_grouped_query_and_missing_group(client):
+    client.post("/datasets/d/import", json={
+        "points": [{"ts": i * NS, "x": 10.0} for i in range(4)],
+        "batch_id": "b1"})
+    pts = []
+    for i in range(4, 9):
+        pts.append({"ts": i * NS, "x": 10.0, "dev": "a"})
+        pts.append({"ts": i * NS + 1, "x": 10.0, "dev": "b"})
+    pts.append({"ts": 8 * NS + 2, "x": 99.0, "dev": "a"})
+    client.post("/datasets/d/import", json={
+        "points": pts, "batch_id": "b2", "append": True})
+    r = client.post("/query", json={
+        "dataset": "d", "metric_field": "x",
+        "start_ts": 0, "end_ts": 9 * NS, "window_seconds": 1,
+        "group_by": "dev"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["group_field"] == "dev"
+    groups = {g["group_value"]: g for g in body["groups"]}
+    assert set(groups) == {"a", "b", "__missing__"}
+    assert groups["a"]["windows"][-1]["status"] == "anomaly"
+    assert groups["b"]["windows"][-1]["status"] != "anomaly"
+    # 可复现：同参数再查一次逐字节一致
+    assert client.post("/query", json={
+        "dataset": "d", "metric_field": "x",
+        "start_ts": 0, "end_ts": 9 * NS, "window_seconds": 1,
+        "group_by": "dev"}).json() == body
+
+
+def test_http_stale_base_version_and_budget_codes(client):
+    client.post("/datasets/d/import", json={
+        "points": [{"ts": 0, "x": 1.0}], "batch_id": "b1"})
+    client.post("/datasets/d/import", json={
+        "points": [{"ts": NS, "x": 2.0}], "batch_id": "b2", "append": True})
+    # 过期 base_version -> 409 stale_base_version
+    r = client.post("/datasets/d/import", json={
+        "points": [{"ts": 2 * NS, "x": 3.0}], "batch_id": "b3",
+        "append": True, "base_version": 1})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "stale_base_version"
+    # 基于最新版本重试成功
+    r2 = client.post("/datasets/d/import", json={
+        "points": [{"ts": 2 * NS, "x": 3.0}], "batch_id": "b3",
+        "append": True, "base_version": 2})
+    assert r2.status_code == 200 and r2.json()["version"] == 3
+
+
+def test_http_query_budget_exceeded_is_413():
+    from anomaly_service.config import ServiceConfig
+
+    svc = AnomalyService(ServiceConfig(max_query_windows=3))
+    c = TestClient(create_app(svc))
+    c.post("/datasets/d/import", json={
+        "points": [{"ts": i * NS, "x": 1.0} for i in range(6)],
+        "batch_id": "b1"})
+    r = c.post("/query", json={
+        "dataset": "d", "metric_field": "x",
+        "start_ts": 0, "end_ts": 6 * NS, "window_seconds": 1})
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "query_budget_exceeded"
+    # 预算错误与参数错误（422）状态码不同
+    r2 = c.post("/query", json={
+        "dataset": "d", "metric_field": "x",
+        "start_ts": 6 * NS, "end_ts": 0, "window_seconds": 1})
+    assert r2.status_code == 422

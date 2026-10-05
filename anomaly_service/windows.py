@@ -19,6 +19,10 @@ from .models import DataPoint
 _NS_PER_SEC = 1_000_000_000
 _METHODS = ("mean", "sum", "min", "max", "count")
 
+#: 内部分桶用的缺失分组哨兵（私有对象，绝不与真实数据值冲突）；
+#: 由上层转换为对外可见的 ``models.MISSING_GROUP`` 标签。
+MISSING_KEY: object = object()
+
 
 def align_floor(ts: int, window_ns: int) -> int:
     """floor 除法（对齐负数时间戳同样正确）。"""
@@ -105,3 +109,47 @@ def aggregate(values: list[float], method: str) -> float | None:
     if method == "max":
         return max(values)
     return float(len(values))
+
+
+def bucket_by_group(
+    points: tuple[DataPoint, ...],
+    metric_field: str,
+    group_field: str | None,
+    start_ts: int,
+    end_ts: int,
+    window_seconds: int,
+) -> tuple[dict[object, dict[int, list[float]]], int]:
+    """单趟扫描：按分组维度 + 完整窗口落桶。
+
+    返回 ``(分组值 -> 窗口起点 -> 有效数值列表, 区间内参与计算的点数)``。
+    - ``group_field`` 为 None 时全部点归入唯一的 ``None`` 组（等价不分组）；
+    - 数据点缺少分组键或值为 ``None`` 时归入私有哨兵 ``MISSING_KEY`` 组
+      （由上层映射为显式标签），不会被悄悄丢弃；
+    - 点数统计只计落在 ``[start_ts, end_ts)`` 内的点，供查询预算裁决。
+    结果与输入顺序无关（落桶按 floor 对齐，天然可复现）。
+    """
+    window_ns = validate_range(start_ts, end_ts, window_seconds)
+    buckets: dict[object, dict[int, list[float]]] = {}
+    in_range = 0
+    for p in points:
+        if p.ts < start_ts or p.ts >= end_ts:
+            continue
+        w_start = align_floor(p.ts, window_ns)
+        if w_start < start_ts or w_start + window_ns > end_ts:
+            continue  # 不完整窗口不参与
+        in_range += 1
+        if group_field is None:
+            group_key: object = None
+        else:
+            group_key = p.values.get(group_field)
+            if group_key is None:
+                group_key = MISSING_KEY
+        value = p.values.get(metric_field)
+        if value is None or isinstance(value, bool) or not isinstance(
+            value, (int, float)
+        ):
+            continue
+        buckets.setdefault(group_key, {}).setdefault(w_start, []).append(
+            float(value)
+        )
+    return buckets, in_range

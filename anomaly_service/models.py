@@ -97,3 +97,25 @@ class QueryResult:
     start_ts: int
     end_ts: int
     windows: tuple[WindowResult, ...]
+
+
+#: 数据点缺少分组维度值时归入的显式分组键（不悄悄丢弃）。
+MISSING_GROUP = "__missing__"
+
+
+@dataclass(frozen=True)
+class GroupResult:
+    group_value: object  # 分组维度值；缺失时为 MISSING_GROUP
+    windows: tuple[WindowResult, ...]
+
+
+@dataclass(frozen=True)
+class GroupedQueryResult:
+    dataset: str
+    version: int
+    metric_field: str
+    group_field: str
+    window_seconds: int
+    start_ts: int
+    end_ts: int
+    groups: tuple[GroupResult, ...]

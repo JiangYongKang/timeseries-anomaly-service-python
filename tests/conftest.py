@@ -68,3 +68,30 @@ def log_query(title: str, result) -> None:
             None if ev is None else ev.zscore,
             None if ev is None else ev.reason,
         )
+
+
+def log_grouped_query(title: str, result) -> None:
+    log.info(
+        "[%s] version=v%s field=%s group_by=%s window=%ss range=(%s,%s)",
+        title,
+        result.version,
+        result.metric_field,
+        result.group_field,
+        result.window_seconds,
+        result.start_ts,
+        result.end_ts,
+    )
+    for g in result.groups:
+        log.info("  group=%s", g.group_value)
+        for w in g.windows:
+            ev = w.evidence
+            log.info(
+                "    window=[%s,%s) count=%s agg=%s status=%s z=%s reason=%s",
+                w.window_start,
+                w.window_end,
+                w.count,
+                w.aggregate,
+                w.status.value,
+                None if ev is None else ev.zscore,
+                None if ev is None else ev.reason,
+            )

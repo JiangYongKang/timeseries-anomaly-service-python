@@ -24,19 +24,27 @@ from .errors import (
     DatasetNotFoundError,
     DuplicateBatchError,
     FieldNotFoundError,
+    QueryBudgetError,
     TimeoutError_,
     ValidationError,
 )
 from .models import (
+    MISSING_GROUP,
     FieldType,
+    GroupedQueryResult,
+    GroupResult,
     ImportResult,
     QueryResult,
-    Schema,
     WindowResult,
 )
 from .store import VersionStore
 from .validation import DataValidator
-from .windows import aggregate, enumerate_window_slots, window_windows
+from .windows import (
+    MISSING_KEY,
+    aggregate,
+    bucket_by_group,
+    enumerate_window_slots,
+)
 
 
 class _Deadline:
@@ -70,6 +78,10 @@ class AnomalyService:
 
     # -- 导入 -------------------------------------------------------------
 
+    def _effective_timeout(self, timeout: float | None) -> float:
+        """未显式指定超时时，默认截止时间真实生效。"""
+        return timeout if timeout is not None else self.config.default_timeout_seconds
+
     def import_data(
         self,
         dataset: str,
@@ -77,12 +89,19 @@ class AnomalyService:
         *,
         batch_id: str | None = None,
         append: bool = False,
+        base_version: int | None = None,
         timeout: float | None = None,
         cancel_event: threading.Event | None = None,
     ) -> ImportResult:
         if not isinstance(dataset, str) or not dataset:
             raise ValidationError("dataset 必须是非空字符串")
-        deadline = _Deadline(timeout, cancel_event)
+        if base_version is not None and (
+            not isinstance(base_version, int)
+            or isinstance(base_version, bool)
+            or base_version < 0
+        ):
+            raise ValidationError("base_version 必须是非负整数")
+        deadline = _Deadline(self._effective_timeout(timeout), cancel_event)
         deadline.check()
 
         payload_hash = canonical_payload_hash(raw_points)
@@ -95,12 +114,12 @@ class AnomalyService:
         )
         deadline.check()
 
+        # 快速预检（最终在 store 锁内仍会复查，保证并发正确性）
         try:
-            parent = self._store.latest_version(dataset)
+            self._store.latest_version(dataset)
         except DatasetNotFoundError:
             if append:
                 raise
-            final_schema: Schema = parsed_schema
             do_append = False
         else:
             if not append:
@@ -108,18 +127,17 @@ class AnomalyService:
                     f"数据集 {dataset!r} 已存在版本；请使用 append=true 追加",
                     code="dataset_exists",
                 )
-            final_schema = self._validator.check_compatible_append(
-                parent.schema_, parsed_schema
-            )
             do_append = True
 
         return self._store.import_batch(
             dataset,
             new_points,
-            final_schema,
+            parsed_schema,
             batch_id,
             payload_hash,
             append=do_append,
+            merge_schema=self._validator.check_compatible_append,
+            base_version=base_version,
             before_publish=lambda *_: deadline.check(),
         )
 
@@ -135,14 +153,17 @@ class AnomalyService:
         *,
         version: int | None = None,
         baseline_aggregate: str = "mean",
+        group_by: str | None = None,
         timeout: float | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> QueryResult:
+    ) -> QueryResult | GroupedQueryResult:
         if not isinstance(metric_field, str) or not metric_field:
             raise ValidationError("metric_field 必须是非空字符串")
         if baseline_aggregate not in ("mean", "sum", "min", "max", "count"):
             raise ValidationError(f"不支持的聚合方法: {baseline_aggregate!r}")
-        deadline = _Deadline(timeout, cancel_event)
+        if group_by is not None and (not isinstance(group_by, str) or not group_by):
+            raise ValidationError("group_by 必须是非空字符串")
+        deadline = _Deadline(self._effective_timeout(timeout), cancel_event)
         deadline.check()
 
         snapshot = (
@@ -155,18 +176,95 @@ class AnomalyService:
             raise FieldNotFoundError(
                 f"版本 v{snapshot.version} 中不存在可聚合数值字段 {metric_field!r}"
             )
+        if group_by is not None:
+            group_spec = snapshot.schema_.get(group_by)
+            if group_spec is None:
+                raise FieldNotFoundError(
+                    f"版本 v{snapshot.version} 中不存在分组字段 {group_by!r}"
+                )
+            if group_spec.type is FieldType.FLOAT:
+                raise ValidationError(
+                    f"分组字段 {group_by!r} 为 float，不是可枚举的分类维度",
+                    code="invalid_group_field",
+                )
+
+        slots = enumerate_window_slots(start_ts, end_ts, window_seconds)
+        # 单趟扫描：分组落桶 + 统计区间内参与计算的点数
+        buckets, in_range_points = bucket_by_group(
+            snapshot.points, metric_field, group_by, start_ts, end_ts, window_seconds
+        )
+        deadline.check()
+
+        # -- 资源预算：先裁决再计算，超限明确失败且无任何副作用 --
+        if in_range_points > self.config.max_query_points:
+            raise QueryBudgetError(
+                f"查询涉及 {in_range_points} 个数据点，超过单次查询上限 "
+                f"{self.config.max_query_points}"
+            )
+        group_keys = sorted(
+            buckets, key=lambda g: (g is MISSING_KEY, str(g))
+        )
+        n_groups = len(group_keys) if group_by is not None else 1
+        total_windows = len(slots) * n_groups
+        if total_windows > self.config.max_query_windows:
+            raise QueryBudgetError(
+                f"查询将产生 {total_windows} 个窗口（{len(slots)} 槽位 × "
+                f"{n_groups} 组），超过单次查询上限 {self.config.max_query_windows}"
+            )
 
         detector = BaselineAnomalyDetector(
             min_baseline=self.config.min_baseline_windows,
             threshold=self.config.anomaly_zscore_threshold,
             aggregate_method=baseline_aggregate,
         )
-        buckets = window_windows(
-            snapshot.points, metric_field, start_ts, end_ts, window_seconds
-        )
-        by_start = {ws: vals for ws, _, vals in buckets}
-        slots = enumerate_window_slots(start_ts, end_ts, window_seconds)
 
+        if group_by is None:
+            windows = self._judge_series(
+                detector, slots, buckets.get(None, {}), baseline_aggregate, deadline
+            )
+            return QueryResult(
+                dataset=dataset,
+                version=snapshot.version,
+                metric_field=metric_field,
+                window_seconds=window_seconds,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                windows=windows,
+            )
+
+        groups: list[GroupResult] = []
+        for idx, key in enumerate(group_keys):
+            if idx % 16 == 0:
+                deadline.check()
+            label = MISSING_GROUP if key is MISSING_KEY else key
+            groups.append(
+                GroupResult(
+                    group_value=label,
+                    windows=self._judge_series(
+                        detector, slots, buckets[key], baseline_aggregate, deadline
+                    ),
+                )
+            )
+        return GroupedQueryResult(
+            dataset=dataset,
+            version=snapshot.version,
+            metric_field=metric_field,
+            group_field=group_by,
+            window_seconds=window_seconds,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            groups=tuple(groups),
+        )
+
+    @staticmethod
+    def _judge_series(
+        detector: BaselineAnomalyDetector,
+        slots: list[tuple[int, int]],
+        by_start: dict[int, list[float]],
+        baseline_aggregate: str,
+        deadline: _Deadline,
+    ) -> tuple[WindowResult, ...]:
+        """对单条序列逐窗口聚合并判定；无数据窗口判 no_data，绝不误报。"""
         results: list[WindowResult] = []
         baseline_series: list[float] = []
         for idx, (ws, we) in enumerate(slots):
@@ -187,15 +285,7 @@ class AnomalyService:
                     evidence=evidence,
                 )
             )
-        return QueryResult(
-            dataset=dataset,
-            version=snapshot.version,
-            metric_field=metric_field,
-            window_seconds=window_seconds,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            windows=tuple(results),
-        )
+        return tuple(results)
 
     def list_versions(self, dataset: str) -> list[int]:
         return self._store.list_versions(dataset)

@@ -88,6 +88,18 @@ class ResourceLimitError(AnomalyServiceError):
     code = "resource_limit_exceeded"
 
 
+class QueryBudgetError(ResourceLimitError):
+    """单次查询超出窗口数 / 参与计算点数预算。"""
+
+    code = "query_budget_exceeded"
+
+
+class StaleSchemaError(ValidationError):
+    """追加请求基于已过时的版本结构（乐观并发校验失败）。"""
+
+    code = "stale_base_version"
+
+
 class TimeoutError_(AnomalyServiceError):
     """操作超过截止时间。"""
 
