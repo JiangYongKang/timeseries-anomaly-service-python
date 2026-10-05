@@ -31,6 +31,7 @@ _CONFLICT_CODES = {
     "duplicate_timestamp",
     "dataset_exists",
     "incompatible_schema",
+    "stale_schema",
 }
 
 
@@ -44,6 +45,18 @@ class ImportRequest(BaseModel):
 class QueryRequest(BaseModel):
     dataset: str
     metric_field: str
+    start_ts: int
+    end_ts: int
+    window_seconds: int = Field(gt=0)
+    version: int | None = None
+    baseline_aggregate: str = "mean"
+    timeout: float | None = Field(default=None, gt=0)
+
+
+class GroupedQueryRequest(BaseModel):
+    dataset: str
+    metric_field: str
+    group_field: str
     start_ts: int
     end_ts: int
     window_seconds: int = Field(gt=0)
@@ -106,11 +119,47 @@ def create_app(service: AnomalyService | None = None) -> FastAPI:
         )
         return _serialize_query(result)
 
+    @app.post("/query/grouped")
+    def query_grouped(req: GroupedQueryRequest):
+        result = service.query_grouped(
+            req.dataset,
+            req.metric_field,
+            req.group_field,
+            req.start_ts,
+            req.end_ts,
+            req.window_seconds,
+            version=req.version,
+            baseline_aggregate=req.baseline_aggregate,
+            timeout=req.timeout,
+        )
+        return _serialize_grouped_query(result)
+
     @app.get("/datasets/{dataset}/versions")
     def versions(dataset: str):
         return {"dataset": dataset, "versions": service.list_versions(dataset)}
 
     return app
+
+
+def _serialize_window(w) -> dict:
+    return {
+        "window_start": w.window_start,
+        "window_end": w.window_end,
+        "count": w.count,
+        "aggregate": w.aggregate,
+        "status": w.status.value,
+        "evidence": None
+        if w.evidence is None
+        else {
+            "metric": w.evidence.metric,
+            "window_value": w.evidence.window_value,
+            "baseline_mean": w.evidence.baseline_mean,
+            "baseline_std": w.evidence.baseline_std,
+            "zscore": w.evidence.zscore,
+            "threshold": w.evidence.threshold,
+            "reason": w.evidence.reason,
+        },
+    }
 
 
 def _serialize_query(result) -> dict:
@@ -121,25 +170,24 @@ def _serialize_query(result) -> dict:
         "window_seconds": result.window_seconds,
         "start_ts": result.start_ts,
         "end_ts": result.end_ts,
-        "windows": [
+        "windows": [_serialize_window(w) for w in result.windows],
+    }
+
+
+def _serialize_grouped_query(result) -> dict:
+    return {
+        "dataset": result.dataset,
+        "version": result.version,
+        "metric_field": result.metric_field,
+        "group_field": result.group_field,
+        "window_seconds": result.window_seconds,
+        "start_ts": result.start_ts,
+        "end_ts": result.end_ts,
+        "groups": [
             {
-                "window_start": w.window_start,
-                "window_end": w.window_end,
-                "count": w.count,
-                "aggregate": w.aggregate,
-                "status": w.status.value,
-                "evidence": None
-                if w.evidence is None
-                else {
-                    "metric": w.evidence.metric,
-                    "window_value": w.evidence.window_value,
-                    "baseline_mean": w.evidence.baseline_mean,
-                    "baseline_std": w.evidence.baseline_std,
-                    "zscore": w.evidence.zscore,
-                    "threshold": w.evidence.threshold,
-                    "reason": w.evidence.reason,
-                },
+                "group_key": g.group_key,
+                "windows": [_serialize_window(w) for w in g.windows],
             }
-            for w in result.windows
+            for g in result.groups
         ],
     }

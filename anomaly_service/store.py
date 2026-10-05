@@ -86,10 +86,14 @@ class VersionStore:
         payload_hash: str,
         append: bool,
         *,
+        merge_schema=None,
         before_publish=None,
     ) -> ImportResult:
         """在数据集锁内完成全部校验后一次性发布新版本。
 
+        ``merge_schema(parent_schema, parsed_schema)`` 可选：追加时在持锁
+        状态下针对**真实父版本**做结构合并/演进校验（调用方借此检测基于
+        过时结构的并发追加），抛异常则中止且无任何写入。
         ``before_publish(state, parent)`` 钩子可选，在持锁状态下、发布前
         调用（供取消/超时检查）；抛异常则中止且无任何写入。
         """
@@ -123,6 +127,12 @@ class VersionStore:
                     f"数据集 {dataset!r} 已存在版本；请使用 append=true 追加",
                     code="dataset_exists",
                 )
+
+            # 结构合并必须在锁内针对真实父版本进行：并发追加各自携带新列时，
+            # 后到的请求若基于过时结构，会在这里被明确拒绝，而不会发布一个
+            # “声明字段与实际数据对不上”的版本。
+            if parent is not None and merge_schema is not None:
+                schema = merge_schema(parent.schema_, schema)
 
             if parent is not None:
                 overlap = {p.ts for p in parent.points}.intersection(

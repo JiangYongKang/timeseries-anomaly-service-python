@@ -88,6 +88,18 @@ class ResourceLimitError(AnomalyServiceError):
     code = "resource_limit_exceeded"
 
 
+class QueryBudgetExceededError(ResourceLimitError):
+    """单次查询超出窗口/数据量预算；与参数写错（422）明确区分。"""
+
+    code = "query_budget_exceeded"
+
+
+class StaleSchemaError(ValidationError):
+    """追加请求基于已过时的 schema 发出（并发演进冲突），可安全重试。"""
+
+    code = "stale_schema"
+
+
 class TimeoutError_(AnomalyServiceError):
     """操作超过截止时间。"""
 
